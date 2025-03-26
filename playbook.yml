@@ -1,0 +1,99 @@
+- name: Generate and send sample log to OpenSearch and verify receipt
+  hosts: "{{ hosts }}"
+  gather_facts: no
+  become: true
+  vars:
+    log_file_path: "/var/log/sample.log"
+    opensearch_host: "{{opensearchDomain}}:{{opensearchPort}}"
+    opensearch_index: "filebeat*sample-*"
+    filebeat_config_path: "/etc/filebeat/filebeat.yml" # directory of filebeat config (you can change it)
+    opensearch_vm: "{{ opensearch_vm }}"
+    opensearch_admin_user: "{{ opensearch_admin_user }}"
+    opensearch_admin_password: "{{ opensearch_admin_password }}"
+    hex_chars: '0123456789ABCDEF' # you can use another string
+
+  tasks:
+    - name: Generate random log message
+      ansible.builtin.set_fact:
+        log_data: "{{ query('community.general.random_string', length=8, override_all=hex_chars) | first }}"
+      register: log_creation
+      
+    - name: Show generated log
+      ansible.builtin.debug:
+        msg: "Generated log value: {{ log_data }}"
+
+    - name: Write log to file
+      ansible.builtin.lineinfile:
+        path: "{{ log_file_path }}"
+        line: "{{ log_data }}"
+        create: yes
+      register: file_write
+
+    - name: Show file write results
+      ansible.builtin.debug:
+        var: file_write
+
+    - name: Verify Filebeat service status
+      ansible.builtin.systemd:
+        name: filebeat
+        state: started
+      register: filebeat_status
+
+    - name: Show Filebeat status
+      ansible.builtin.debug:
+        var: filebeat_status
+
+    - name: Wait for log processing
+      ansible.builtin.pause:
+        seconds: 80  #this time choos that i sure the log recieve 
+      register: waiting
+
+    - name: Show pause results
+      ansible.builtin.debug:
+        var: waiting
+
+    - name: Verify OpenSearch connectivity
+      ansible.builtin.uri:
+        url: "{{ opensearch_host }}/_cat/health"
+        method: GET
+        user: "{{ opensearch_admin_user }}"
+        password: "{{ opensearch_admin_password }}"
+        validate_certs: no
+        return_content: yes
+      delegate_to: "{{ opensearch_vm }}"
+      register: connectivity_check
+
+    - name: Show connectivity results
+      ansible.builtin.debug:
+        var: connectivity_check
+
+    - name: Search for log in OpenSearch
+      ansible.builtin.uri:
+        url: "{{ opensearch_host }}/{{ opensearch_index }}/_search"
+        method: GET
+        user: "{{ opensearch_admin_user }}"
+        password: "{{ opensearch_admin_password }}"
+        validate_certs: no
+        return_content: yes
+        body_format: json
+        body:
+          query:
+            match:
+              message: "{{ log_data }}"
+      delegate_to: "{{ opensearch_vm }}"
+      register: opensearch_query
+      retries: 3
+      delay: 30
+      until: opensearch_query.json.hits.total.value > 0
+
+    - name: Show raw OpenSearch response
+      ansible.builtin.debug:
+        var: opensearch_query.json
+
+    - name: Validate results
+      ansible.builtin.assert:
+        that:
+          - opensearch_query.json.hits.total.value > 0
+          - log_data in opensearch_query.json.hits.hits.0._source.message
+        success_msg: "Log verified successfully in OpenSearch"
+        fail_msg: "Failed to find log in OpenSearch"
